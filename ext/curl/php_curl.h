@@ -165,6 +165,12 @@ typedef struct {
 #if LIBCURL_VERSION_NUM >= 0x071000 /* Available since 7.16.0 */
 	php_curl_callback_function *sockopt;
 #endif
+#if LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+	php_curl_callback_function *opensocket;
+#endif
+#if LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+	php_curl_callback_function *closesocket;
+#endif
 } php_curl_handlers;
 
 struct _php_curl_error  {

@@ -90,6 +90,10 @@
 
 #if PHP_VERSION_ID >= 50301 && (HAVE_SOCKETS || defined(COMPILE_DL_SOCKETS))
 # include "ext/sockets/php_sockets.h"
+# include <arpa/inet.h>
+# ifndef PHP_WIN32
+#  include <sys/un.h>
+# endif
 # define PHPCURL_SOCKETS_SUPPORT
 #endif
 
@@ -1070,6 +1074,11 @@ PHP_MINIT_FUNCTION(curl)
 	REGISTER_CURL_CONSTANT(CURLOPT_SSH_HOST_PUBLIC_KEY_MD5);
 #endif
 
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+	REGISTER_CURL_CONSTANT(CURLOPT_OPENSOCKETFUNCTION);
+	REGISTER_CURL_CONSTANT(CURL_SOCKET_BAD);
+#endif
+
 #if LIBCURL_VERSION_NUM >= 0x071200 /* Available since 7.18.0 */
 	REGISTER_CURL_CONSTANT(CURLOPT_PROXY_TRANSFER_MODE);
 	REGISTER_CURL_CONSTANT(CURLPAUSE_ALL);
@@ -1229,6 +1238,10 @@ PHP_MINIT_FUNCTION(curl)
 #if LIBCURL_VERSION_NUM >= 0x071506 /* Available since 7.21.6 */
 	REGISTER_CURL_CONSTANT(CURLOPT_ACCEPT_ENCODING);
 	REGISTER_CURL_CONSTANT(CURLOPT_TRANSFER_ENCODING);
+#endif
+
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+	REGISTER_CURL_CONSTANT(CURLOPT_CLOSESOCKETFUNCTION);
 #endif
 
 #if LIBCURL_VERSION_NUM >= 0x071600 /* Available since 7.22.0 */
@@ -1570,6 +1583,187 @@ static int curl_sockopt(void *ctx, curl_socket_t curlfd, curlsocktype purpose)
 /* }}} */
 #endif
 
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+
+
+
+int convert_curl_addr_to_zval(struct curl_sockaddr *address, zval *native_addr) {
+	struct sockaddr *addr = &address->addr;
+
+	switch (addr->sa_family) {
+		case AF_INET: {
+			struct sockaddr_in* addr4 = (struct sockaddr_in*)addr;
+			char addr4_str[INET_ADDRSTRLEN];
+
+			if (!inet_ntop(addr->sa_family, &addr4->sin_addr, (char *)&addr4_str, INET_ADDRSTRLEN)) {
+				return 1;
+			}
+			add_next_index_string(native_addr, (char*)&addr4_str);
+			add_next_index_long(native_addr, ntohs(addr4->sin_port));
+			break;
+		}
+		case AF_INET6: {
+			struct sockaddr_in6* addr6 = (struct sockaddr_in6*)addr;
+			char addr6_str[INET6_ADDRSTRLEN];
+
+			if (!inet_ntop(addr->sa_family, &addr6->sin6_addr, (char *)&addr6_str, INET6_ADDRSTRLEN)) {
+				return 1;
+			}
+			add_next_index_string(native_addr, addr6_str);
+			add_next_index_long(native_addr, ntohs(addr6->sin6_port));
+			add_next_index_long(native_addr, ntohl(addr6->sin6_flowinfo));
+			add_next_index_long(native_addr, ntohl(addr6->sin6_scope_id));
+			break;
+		}
+# ifndef PHP_WIN32
+		case AF_UNIX: {
+			struct sockaddr_un* addru = (struct sockaddr_un*)addr;
+			add_next_index_string(native_addr, addru->sun_path);
+			break;
+		}
+# endif
+		default: {
+			php_error_docref(NULL, E_WARNING, "Unhandled address family");
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* {{{ curl_opensocket
+ */
+static curl_socket_t curl_opensocket(void *ctx, curlsocktype purpose, struct curl_sockaddr *address) {
+	php_curl *ch = (php_curl *) ctx;
+	php_curl_callback_function *t = ch->handlers->opensocket;
+	int rval = CURL_SOCKET_BAD;
+	switch (t->method) {
+		case PHP_CURL_USER: {
+			zval argv[3];
+			zval php_addr;
+			zval retval;
+			int  error;
+			zend_fcall_info fci;
+
+			array_init(&php_addr);
+
+			if (convert_curl_addr_to_zval(address, &php_addr)) {
+				php_error_docref(NULL, E_WARNING, "Unsupported address in CURLOPT_OPENSOCKETFUNCTION???");
+			} else {
+				ZVAL_RES(&argv[0], ch->res);
+				Z_ADDREF(argv[0]);
+				ZVAL_LONG(&argv[1], purpose);
+				array_init(&argv[2]);
+				add_assoc_long(&argv[2], "family", address->family);
+				add_assoc_long(&argv[2], "socktype", address->socktype);
+				add_assoc_long(&argv[2], "protocol", address->protocol);
+				add_assoc_zval(&argv[2], "address", &php_addr);
+
+				fci.size = sizeof(fci);
+				ZVAL_COPY_VALUE(&fci.function_name, &t->func_name);
+				fci.object = NULL;
+				fci.retval = &retval;
+				fci.param_count = 3;
+				fci.params = argv;
+				fci.no_separation = 0;
+
+				ch->in_callback = 1;
+				error = zend_call_function(&fci, &t->fci_cache);
+				ch->in_callback = 0;
+
+				if (error == FAILURE) {
+					php_error_docref(NULL, E_WARNING, "Cannot call the CURLOPT_OPENSOCKETFUNCTION");
+				} else if (!Z_ISUNDEF(retval)) {
+					if (Z_TYPE_P(&retval) == IS_RESOURCE) {
+						php_socket *php_sock = (php_socket *)
+							zend_fetch_resource2_ex(&retval, NULL, php_sockets_le_socket(), php_sockets_le_socket());
+						if (php_sock) {
+							rval = php_sock->bsd_socket;
+							php_sock->bsd_socket = -1;
+						} else {
+							rval = CURL_SOCKET_BAD;
+						}
+					} else {
+						if (Z_TYPE_P(&retval) != IS_LONG) {
+							rval = CURL_SOCKET_BAD;
+						} else {
+							rval = Z_LVAL_P(&retval);
+						}
+					}
+				}
+			}
+			zval_ptr_dtor(&retval);
+			zval_ptr_dtor(&argv[0]);
+			zval_ptr_dtor(&argv[1]);
+			zval_ptr_dtor(&argv[2]);
+
+			/* XXX: Per cURL's docs the address is meant to be mutable, but other
+			   cURL wrappers don't seem to abide by that. Should we? */
+
+			zval_ptr_dtor(&php_addr);
+			break;
+		}
+	}
+	return rval;
+
+}
+/* }}} */
+#endif
+
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+/* {{{ curl_opensocket
+ */
+static int curl_closesocket(void *ctx, curl_socket_t curlfd) {
+	// XXX: This should not leak anything. The BSD socket should be the existing fd.
+	php_curl *ch = (php_curl *) ctx;
+	php_curl_callback_function *t = ch->handlers->closesocket;
+	int rval = 0;
+	switch (t->method) {
+		case PHP_CURL_USER: {
+			zval argv[2];
+			zval retval;
+			int  error;
+			zend_fcall_info fci;
+			php_socket *php_sock = emalloc(sizeof *php_sock);
+
+			/* This temporarily wraps the exiting fd in a php_sock so that
+			   the fd can be manipulated using the PHP socket API */
+			php_sock->bsd_socket = curlfd;
+			php_sock->type       = PF_UNSPEC;
+			php_sock->error      = 0;
+			php_sock->blocking   = 1;
+			ZVAL_NULL(&php_sock->zstream);
+
+			ZVAL_RES(&argv[0], ch->res);
+			Z_ADDREF(argv[0]);
+			ZVAL_RES(&argv[1], zend_register_resource(php_sock, php_sockets_le_socket()));
+
+			fci.size = sizeof(fci);
+			ZVAL_COPY_VALUE(&fci.function_name, &t->func_name);
+			fci.object = NULL;
+			fci.retval = &retval;
+			fci.param_count = 2;
+			fci.params = argv;
+			fci.no_separation = 0;
+
+			ch->in_callback = 1;
+			error = zend_call_function(&fci, &t->fci_cache);
+			ch->in_callback = 0;
+			if (error == FAILURE) {
+				php_error_docref(NULL, E_WARNING, "Cannot call the CURLOPT_SOCKOPTFUNCTION");
+			} else if (!Z_ISUNDEF(retval)) {
+				_php_curl_verify_handlers(ch, 1);
+				rval = zval_get_long(&retval);
+			}
+			zval_ptr_dtor(&argv[0]);
+			zval_ptr_dtor(&argv[1]);
+			zval_ptr_dtor(&retval);
+			break;
+		}
+	}
+	return rval;
+}
+/* }}} */
+#endif
 
 #if LIBCURL_VERSION_NUM >= 0x071500 /* Available since 7.21.0 */
 /* {{{ curl_fnmatch
@@ -2147,6 +2341,27 @@ void _php_setup_easy_copy_handlers(php_curl *ch, php_curl *source)
 	}
 # endif
 
+#endif
+
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+	if (source->handlers->opensocket) {
+		ch->handlers->opensocket = ecalloc(1, sizeof(php_curl_callback_function));
+		if (!Z_ISUNDEF(source->handlers->opensocket->func_name)) {
+			ZVAL_COPY(&ch->handlers->opensocket->func_name, &source->handlers->opensocket->func_name);
+		}
+		ch->handlers->opensocket->method = source->handlers->opensocket->method;
+		curl_easy_setopt(ch->cp, CURLOPT_OPENSOCKETDATA, (void *) ch);
+	}
+#endif
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+	if (source->handlers->closesocket) {
+		ch->handlers->closesocket = ecalloc(1, sizeof(php_curl_callback_function));
+		if (!Z_ISUNDEF(source->handlers->closesocket->func_name)) {
+			ZVAL_COPY(&ch->handlers->closesocket->func_name, &source->handlers->closesocket->func_name);
+		}
+		ch->handlers->closesocket->method = source->handlers->closesocket->method;
+		curl_easy_setopt(ch->cp, CURLOPT_CLOSESOCKETDATA, (void *) ch);
+	}
 #endif
 
 	efree(ch->to_free->slist);
@@ -3010,6 +3225,36 @@ static int _php_curl_setopt(php_curl *ch, zend_long option, zval *zvalue) /* {{{
 			break;
 #endif
 
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+		case CURLOPT_OPENSOCKETFUNCTION:
+			curl_easy_setopt(ch->cp, CURLOPT_OPENSOCKETFUNCTION, curl_opensocket);
+			curl_easy_setopt(ch->cp, CURLOPT_OPENSOCKETDATA, ch);
+			if (ch->handlers->opensocket == NULL) {
+				ch->handlers->opensocket = ecalloc(1, sizeof(php_curl_callback_function));
+			} else if (!Z_ISUNDEF(ch->handlers->opensocket->func_name)) {
+				zval_ptr_dtor(&ch->handlers->opensocket->func_name);
+				ch->handlers->opensocket->fci_cache = empty_fcall_info_cache;
+			}
+			ZVAL_COPY(&ch->handlers->opensocket->func_name, zvalue);
+			ch->handlers->opensocket->method = PHP_CURL_USER;
+			break;
+#endif
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+		case CURLOPT_CLOSESOCKETFUNCTION:
+			curl_easy_setopt(ch->cp, CURLOPT_CLOSESOCKETFUNCTION, curl_closesocket);
+			curl_easy_setopt(ch->cp, CURLOPT_CLOSESOCKETDATA, ch);
+			if (ch->handlers->closesocket == NULL) {
+				ch->handlers->closesocket = ecalloc(1, sizeof(php_curl_callback_function));
+			} else if (!Z_ISUNDEF(ch->handlers->closesocket->func_name)) {
+				zval_ptr_dtor(&ch->handlers->closesocket->func_name);
+				ch->handlers->closesocket->fci_cache = empty_fcall_info_cache;
+			}
+			ZVAL_COPY(&ch->handlers->closesocket->func_name, zvalue);
+			ch->handlers->closesocket->method = PHP_CURL_USER;
+			break;
+
+#endif
+
 #if LIBCURL_VERSION_NUM >= 0x071500 /* Available since 7.21.0 */
 		case CURLOPT_FNMATCH_FUNCTION:
 			curl_easy_setopt(ch->cp, CURLOPT_FNMATCH_FUNCTION, curl_fnmatch);
@@ -3511,6 +3756,19 @@ static void _php_curl_close_ex(php_curl *ch)
 	if (ch->handlers->sockopt) {
 		zval_ptr_dtor(&ch->handlers->sockopt->func_name);
 		efree(ch->handlers->sockopt);
+	}
+#endif
+
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071101 /* Available since 7.17.1 */
+	if (ch->handlers->opensocket) {
+		zval_ptr_dtor(&ch->handlers->opensocket->func_name);
+		efree(ch->handlers->opensocket);
+	}
+#endif
+#if defined(PHPCURL_SOCKETS_SUPPORT) && LIBCURL_VERSION_NUM >= 0x071507 /* Available since 7.21.7 */
+	if (ch->handlers->closesocket) {
+		zval_ptr_dtor(&ch->handlers->closesocket->func_name);
+		efree(ch->handlers->closesocket);
 	}
 #endif
 
